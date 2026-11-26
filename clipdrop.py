@@ -98,6 +98,94 @@ def local_hostname():
     return None
 
 
+# ---------------------------------------------------------------- iPhone shortcuts
+SC_DIR = os.path.join(HOME, "Library", "Application Support", "ClipDrop", "shortcuts")
+SHORTCUTS = {"pull": "Mac to iPhone", "push": "iPhone to Mac"}
+SC_STATE = {"ready": False, "error": None}
+
+
+def _sc_action(ident, params):
+    return {"WFWorkflowActionIdentifier": ident, "WFWorkflowActionParameters": params}
+
+
+def _sc_var(output_uuid, output_name):
+    return {"Value": {"OutputUUID": output_uuid, "Type": "ActionOutput", "OutputName": output_name},
+            "WFSerializationType": "WFTextTokenAttachment"}
+
+
+def _sc_workflow(actions, color):
+    return {
+        "WFWorkflowActions": actions,
+        "WFWorkflowClientVersion": "2302.0.4",
+        "WFWorkflowMinimumClientVersion": 900,
+        "WFWorkflowMinimumClientVersionString": "900",
+        "WFWorkflowIcon": {"WFWorkflowIconStartColor": color, "WFWorkflowIconGlyphNumber": 61440},
+        "WFWorkflowImportQuestions": [],
+        "WFWorkflowInputContentItemClasses": ["WFStringContentItem"],
+        "WFWorkflowOutputContentItemClasses": [],
+        "WFWorkflowTypes": [],
+        "WFQuickActionSurfaces": [],
+        "WFWorkflowHasShortcutInputVariables": False,
+    }
+
+
+def build_shortcuts(url):
+    """Generate both iPhone shortcuts with `url` baked in and sign them with macOS `shortcuts sign`."""
+    import plistlib
+    import uuid
+    SC_STATE.update(ready=False, error=None)
+    try:
+        if shutil.which("shortcuts") is None:
+            raise RuntimeError("The 'shortcuts' command needs macOS 12 Monterey or newer. "
+                               "Set the shortcuts up by hand instead (see README).")
+        os.makedirs(SC_DIR, exist_ok=True)
+        stamp = os.path.join(SC_DIR, ".url")
+        signed = {k: os.path.join(SC_DIR, n + ".shortcut") for k, n in SHORTCUTS.items()}
+        try:
+            if open(stamp).read() == url and all(os.path.getsize(p) > 0 for p in signed.values()):
+                SC_STATE["ready"] = True
+                return signed  # already built for this URL
+        except OSError:
+            pass
+
+        u_get = str(uuid.uuid4()).upper()
+        pull = _sc_workflow([
+            _sc_action("is.workflow.actions.downloadurl",
+                       {"UUID": u_get, "WFURL": url, "WFHTTPMethod": "GET"}),
+            _sc_action("is.workflow.actions.setclipboard",
+                       {"WFInput": _sc_var(u_get, "Contents of URL")}),
+        ], 4271458815)
+
+        u_clip = str(uuid.uuid4()).upper()
+        push = _sc_workflow([
+            _sc_action("is.workflow.actions.getclipboard", {"UUID": u_clip}),
+            _sc_action("is.workflow.actions.downloadurl",
+                       {"WFURL": url, "WFHTTPMethod": "POST", "WFHTTPBodyType": "File",
+                        "WFRequestVariable": _sc_var(u_clip, "Clipboard")}),
+        ], 946986751)
+
+        for key, wf in (("pull", pull), ("push", push)):
+            raw = os.path.join(SC_DIR, f".{key}.unsigned.shortcut")
+            with open(raw, "wb") as f:
+                plistlib.dump(wf, f, fmt=plistlib.FMT_BINARY)
+            if os.path.exists(signed[key]):
+                os.remove(signed[key])
+            r = subprocess.run(["shortcuts", "sign", "--mode", "anyone",
+                                "--input", raw, "--output", signed[key]],
+                               capture_output=True, text=True, timeout=180)
+            if r.returncode != 0 or not os.path.exists(signed[key]):
+                msg = (r.stderr or r.stdout or "").strip()
+                raise RuntimeError("Signing failed. Make sure you're signed in to iCloud on this Mac. "
+                                   + msg[:300])
+        with open(stamp, "w") as f:
+            f.write(url)
+        SC_STATE["ready"] = True
+        return signed
+    except Exception as e:
+        SC_STATE["error"] = str(e)
+        return None
+
+
 LAUNCH_LABEL = "com.identityseal.clipdrop"
 PLIST = os.path.join(HOME, "Library", "LaunchAgents", LAUNCH_LABEL + ".plist")
 
@@ -306,6 +394,27 @@ class Handler(BaseHTTPRequestHandler):
                 text = next((i["text"] for i in reversed(STORE.items) if i["kind"] == "text"), "")
             return self.send(200, text)
 
+        if path.startswith("/sc/"):
+            key = path[4:]
+            if key not in SHORTCUTS:
+                return self.send(404, "Not found")
+            fp = os.path.join(SC_DIR, SHORTCUTS[key] + ".shortcut")
+            if not SC_STATE["ready"] or not os.path.isfile(fp):
+                msg = SC_STATE["error"] or "Still preparing the shortcuts on your Mac. Go back and try again in a few seconds."
+                return self.send(503, SC_PAGE.replace("__MSG__", msg.replace("<", "&lt;")),
+                                 "text/html; charset=utf-8")
+            with open(fp, "rb") as f:
+                data = f.read()
+            return self.send(200, data, "application/octet-stream", {
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(SHORTCUTS[key] + '.shortcut')}"})
+
+        if path == "/api/sc-status":
+            return self.send_json(SC_STATE)
+
+        if path == "/api/reveal" and self.is_local():
+            subprocess.run(["open", SC_DIR], capture_output=True)
+            return self.send_json({"ok": True})
+
         if path.startswith("/f/"):
             name = os.path.basename(unquote(path[3:]))
             fp = os.path.join(FILES_DIR, name)
@@ -384,6 +493,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------- pages
+SC_PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>ClipDrop</title><body style="font-family:-apple-system,system-ui,sans-serif;background:#0f1115;color:#e8e8e8;padding:24px">
+<h3>⏳ Shortcuts not ready</h3><p>__MSG__</p><p><a style="color:#4f8cff" href="javascript:history.back()">← Back</a></p></body>"""
+
 LOCKED_HTML = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>ClipDrop</title><body style="font-family:-apple-system,system-ui,sans-serif;background:#0f1115;color:#e8e8e8;
 display:grid;place-items:center;height:100vh;margin:0;text-align:center;padding:20px">
@@ -460,11 +573,16 @@ PAGE_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <div class="panel" id="scpanel" style="display:none">
-    <b>⚡ iPhone Back Tap (no tapping Copy/Send)</b>
-    <div style="color:var(--muted);font-size:14px;margin:4px 0 8px">Use this URL in both iPhone Shortcuts — see README for the 2-minute setup.</div>
-    <div class="row" style="margin-top:0"><div class="url grow" id="clipurl" style="margin:0;align-self:center"></div>
-    <button class="ghost" id="copyclip">Copy URL</button></div>
+  <div class="panel" id="scpanel">
+    <b>⚡ iPhone shortcuts (Back Tap)</b>
+    <div id="scmsg" style="color:var(--muted);font-size:14px;margin:4px 0 10px">Preparing…</div>
+    <div class="row" id="scphone" style="display:none;margin-top:0">
+      <a class="btn grow" href="#" data-sc="pull">⬇️ Mac to iPhone</a>
+      <a class="btn grow" href="#" data-sc="push">⬆️ iPhone to Mac</a>
+    </div>
+    <div class="row" id="scmac" style="display:none;margin-top:0">
+      <button class="ghost grow" id="reveal">Open shortcuts folder (to AirDrop)</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -589,14 +707,27 @@ addEventListener("drop",e=>{e.preventDefault();dc=0;drop.style.display="none";if
 // Mac view shows the QR code for the phone
 if(IS_MAC){
   $("#qrpanel").style.display="block"; $("#lanurl").textContent=LAN_URL;
-  $("#scpanel").style.display="block"; $("#clipurl").textContent=CLIP_URL;
-  $("#copyclip").onclick=async()=>{await copyText(CLIP_URL); toast("Copied — it's now on your phone page too")};
+  $("#reveal").onclick=()=>fetch("/api/reveal");
   const s=document.createElement("script");
   s.src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js";
   s.onload=()=>{new QRCode($("#qr"),{text:LAN_URL,width:340,height:340,correctLevel:QRCode.CorrectLevel.M});$("#qrbox").style.display="flex"};
   s.onerror=()=>{$("#qr").remove();$("#qrbox").style.display="flex"};
   document.head.appendChild(s);
 }
+// iPhone shortcut install
+document.querySelectorAll("[data-sc]").forEach(a=>a.href=qs("/sc/"+a.dataset.sc));
+async function scStatus(){
+  try{
+    const d=await (await fetch(qs("/api/sc-status"))).json();
+    const m=$("#scmsg");
+    if(d.ready){
+      if(IS_MAC){m.textContent="Ready. Install them on your iPhone from the phone's ClipDrop page, or AirDrop the files.";$("#scmac").style.display="flex"}
+      else{m.innerHTML="Tap each one → <b>Add Shortcut</b>. Then Settings → Accessibility → Touch → <b>Back Tap</b>: Double Tap = Mac to iPhone, Triple Tap = iPhone to Mac.";$("#scphone").style.display="flex"}
+    } else if(d.error){m.textContent="⚠️ "+d.error}
+    else setTimeout(scStatus,2000);
+  }catch(e){setTimeout(scStatus,3000)}
+}
+scStatus();
 poll();
 </script>
 </body></html>
@@ -613,6 +744,7 @@ def main():
     ap.add_argument("--new-token", action="store_true", help="invalidate old phone links")
     ap.add_argument("--interval", type=float, default=0.6, help="clipboard check interval (s)")
     ap.add_argument("--install", action="store_true", help="start ClipDrop automatically at login")
+    ap.add_argument("--shortcuts", action="store_true", help="build the iPhone shortcuts and open their folder")
     ap.add_argument("--uninstall", action="store_true", help="stop starting at login")
     args = ap.parse_args()
 
@@ -636,6 +768,17 @@ def main():
     global CLIP_URL
     CLIP_URL = f"http://{local_hostname() or ip}:{args.port}/api/clip?t={TOKEN}"
     os.makedirs(FILES_DIR, exist_ok=True)
+
+    if args.shortcuts:
+        print("Building and signing iPhone shortcuts…")
+        if build_shortcuts(CLIP_URL):
+            print(f"✅ Done: {SC_DIR}\n   AirDrop both .shortcut files to your iPhone.")
+            subprocess.run(["open", SC_DIR], capture_output=True)
+        else:
+            print("❌ " + SC_STATE["error"])
+        return
+
+    threading.Thread(target=build_shortcuts, args=(CLIP_URL,), daemon=True).start()
 
     try:
         httpd = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
