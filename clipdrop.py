@@ -42,6 +42,7 @@ MAX_TEXT = 2_000_000  # 2 MB of text per item is plenty
 
 TOKEN = ""
 LAN_URL = ""
+CLIP_URL = ""
 
 
 # ---------------------------------------------------------------- helpers
@@ -83,6 +84,62 @@ def lan_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def local_hostname():
+    """Bonjour name like 'Ridwans-MacBook-Pro.local' — survives IP changes."""
+    try:
+        h = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True,
+                           text=True, timeout=2).stdout.strip()
+        if h:
+            return h + ".local"
+    except Exception:
+        pass
+    return None
+
+
+LAUNCH_LABEL = "com.identityseal.clipdrop"
+PLIST = os.path.join(HOME, "Library", "LaunchAgents", LAUNCH_LABEL + ".plist")
+
+
+def install_login_item(port, extra_args):
+    from xml.sax.saxutils import escape
+    script = os.path.abspath(__file__)
+    py = sys.executable or "/usr/bin/python3"
+    args = [py, script, "--no-browser", "--port", str(port)] + extra_args
+    log = os.path.join(HOME, "Library", "Logs", "clipdrop.log")
+    arg_xml = "\n".join(f"    <string>{escape(a)}</string>" for a in args)
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LAUNCH_LABEL}</string>
+  <key>ProgramArguments</key><array>
+{arg_xml}
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key><dict><key>LANG</key><string>en_US.UTF-8</string></dict>
+  <key>StandardOutPath</key><string>{escape(log)}</string>
+  <key>StandardErrorPath</key><string>{escape(log)}</string>
+</dict></plist>
+"""
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    subprocess.run(["launchctl", "unload", PLIST], capture_output=True)
+    with open(PLIST, "w") as f:
+        f.write(plist)
+    subprocess.run(["launchctl", "load", "-w", PLIST], check=False)
+    print(f"✅ ClipDrop will now start automatically at login (running now in the background).")
+    print(f"   Open http://localhost:{port} for the QR code and iPhone shortcut links.")
+    print(f"   Logs: {log}\n   Remove with: python3 {script} --uninstall")
+
+
+def uninstall_login_item():
+    subprocess.run(["launchctl", "unload", "-w", PLIST], capture_output=True)
+    try:
+        os.remove(PLIST)
+        print("✅ Removed. ClipDrop won't start at login anymore.")
+    except FileNotFoundError:
+        print("Nothing to remove — ClipDrop wasn't set to start at login.")
 
 
 def mac_paste():
@@ -229,6 +286,7 @@ class Handler(BaseHTTPRequestHandler):
             html = (PAGE_HTML
                     .replace("__TOKEN__", TOKEN)
                     .replace("__LAN_URL__", LAN_URL)
+                    .replace("__CLIP_URL__", CLIP_URL)
                     .replace("__IS_MAC__", "true" if self.is_local() else "false"))
             return self.send(200, html, "text/html; charset=utf-8",
                              {"Set-Cookie": f"cd={TOKEN}; Path=/; Max-Age=31536000; SameSite=Lax"})
@@ -240,6 +298,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 since = 0
             return self.send_json(STORE.poll(since))
+
+        if path == "/api/clip":
+            # For iPhone Shortcuts: returns the Mac clipboard as plain text
+            text = mac_paste()
+            if text is None:
+                text = next((i["text"] for i in reversed(STORE.items) if i["kind"] == "text"), "")
+            return self.send(200, text)
 
         if path.startswith("/f/"):
             name = os.path.basename(unquote(path[3:]))
@@ -264,12 +329,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.forbidden()
         source = "mac" if self.is_local() else "phone"
 
-        if path == "/api/text":
+        if path in ("/api/text", "/api/clip"):
+            # /api/text: JSON {"text": ...} from the web page
+            # /api/clip: raw text body (or JSON) from iPhone Shortcuts
             try:
-                data = json.loads(self.read_body(MAX_TEXT * 2) or b"{}")
-            except Exception:
-                return self.send_json({"ok": False, "error": "bad request"}, 400)
-            text = str(data.get("text", ""))[:MAX_TEXT]
+                raw = self.read_body(MAX_TEXT * 4)
+            except ValueError:
+                return self.send_json({"ok": False, "error": "too large"}, 413)
+            text = ""
+            if path == "/api/text" or "json" in (self.headers.get("Content-Type") or ""):
+                try:
+                    text = str(json.loads(raw or b"{}").get("text", ""))
+                except Exception:
+                    text = raw.decode("utf-8", "replace") if path == "/api/clip" else ""
+            else:
+                text = raw.decode("utf-8", "replace")
+            text = text[:MAX_TEXT]
             if not text.strip():
                 return self.send_json({"ok": False, "error": "empty"}, 400)
             with STORE.cond:
@@ -385,6 +460,13 @@ PAGE_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <div class="panel" id="scpanel" style="display:none">
+    <b>⚡ iPhone Back Tap (no tapping Copy/Send)</b>
+    <div style="color:var(--muted);font-size:14px;margin:4px 0 8px">Use this URL in both iPhone Shortcuts — see README for the 2-minute setup.</div>
+    <div class="row" style="margin-top:0"><div class="url grow" id="clipurl" style="margin:0;align-self:center"></div>
+    <button class="ghost" id="copyclip">Copy URL</button></div>
+  </div>
+
   <div class="panel">
     <textarea id="input" placeholder="Type or paste here…"></textarea>
     <div class="row">
@@ -400,7 +482,7 @@ PAGE_HTML = r"""<!doctype html>
 <div id="drop">Drop files to share</div>
 
 <script>
-const TOKEN = "__TOKEN__", LAN_URL = "__LAN_URL__", IS_MAC = __IS_MAC__;
+const TOKEN = "__TOKEN__", LAN_URL = "__LAN_URL__", CLIP_URL = "__CLIP_URL__", IS_MAC = __IS_MAC__;
 const $ = s => document.querySelector(s);
 const feed = $("#feed"), statusEl = $("#status");
 const qs = p => p + (p.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(TOKEN);
@@ -492,6 +574,8 @@ async function upload(files){
 }
 
 $("#send").onclick=sendText;
+// Paste into the box = sent. No Send tap needed.
+$("#input").addEventListener("paste",()=>setTimeout(()=>{ if($("#input").value.trim()) sendText() },50));
 $("#input").addEventListener("keydown",e=>{if(e.key==="Enter"&&(e.metaKey||e.ctrlKey))sendText()});
 $("#file").onchange=e=>{upload(e.target.files);e.target.value=""};
 
@@ -505,6 +589,8 @@ addEventListener("drop",e=>{e.preventDefault();dc=0;drop.style.display="none";if
 // Mac view shows the QR code for the phone
 if(IS_MAC){
   $("#qrpanel").style.display="block"; $("#lanurl").textContent=LAN_URL;
+  $("#scpanel").style.display="block"; $("#clipurl").textContent=CLIP_URL;
+  $("#copyclip").onclick=async()=>{await copyText(CLIP_URL); toast("Copied — it's now on your phone page too")};
   const s=document.createElement("script");
   s.src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js";
   s.onload=()=>{new QRCode($("#qr"),{text:LAN_URL,width:340,height:340,correctLevel:QRCode.CorrectLevel.M});$("#qrbox").style.display="flex"};
@@ -526,7 +612,20 @@ def main():
     ap.add_argument("--no-browser", action="store_true", help="don't open the QR page")
     ap.add_argument("--new-token", action="store_true", help="invalidate old phone links")
     ap.add_argument("--interval", type=float, default=0.6, help="clipboard check interval (s)")
+    ap.add_argument("--install", action="store_true", help="start ClipDrop automatically at login")
+    ap.add_argument("--uninstall", action="store_true", help="stop starting at login")
     args = ap.parse_args()
+
+    if args.uninstall:
+        return uninstall_login_item()
+    if args.install:
+        load_token(args.new_token)
+        extra = ["--no-watch"] if args.no_watch else []
+        install_login_item(args.port, extra)
+        if not args.no_browser:
+            time.sleep(1.5)
+            webbrowser.open(f"http://localhost:{args.port}")
+        return
 
     if shutil.which("pbpaste") is None:
         print("⚠️  pbpaste not found — this is meant to run on macOS.")
@@ -534,6 +633,8 @@ def main():
     TOKEN = load_token(args.new_token)
     ip = lan_ip()
     LAN_URL = f"http://{ip}:{args.port}/?t={TOKEN}"
+    global CLIP_URL
+    CLIP_URL = f"http://{local_hostname() or ip}:{args.port}/api/clip?t={TOKEN}"
     os.makedirs(FILES_DIR, exist_ok=True)
 
     try:
@@ -549,6 +650,7 @@ def main():
     print("\n  📋 ClipDrop is running\n")
     print(f"  Phone link : {LAN_URL}")
     print(f"  Mac page   : http://localhost:{args.port}  (shows the QR code)")
+    print(f"  Shortcut URL: {CLIP_URL}")
     print(f"  Files saved: {FILES_DIR}")
     print(f"  Mac clipboard auto-share: {'OFF' if args.no_watch else 'ON'}")
     print("\n  Press Ctrl+C to stop.\n")
